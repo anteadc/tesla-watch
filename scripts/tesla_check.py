@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import time
@@ -77,8 +78,6 @@ def _first(value):
 
 
 def safe(fn, default="Unknown"):
-    """Run fn(), return its result, or default if anything at all goes
-    wrong or the result is empty. Nothing in here can crash the script."""
     try:
         result = fn()
         return result if result not in (None, "") else default
@@ -101,6 +100,34 @@ def find_option_descriptions(car, group_name):
     return found
 
 
+def short_label(text, keyword_map, fallback=None):
+    """Reduce a long descriptive string to a short scan-friendly word, e.g.
+    'Pearl White Multi-Coat' -> 'White'. Falls back to the original text if
+    nothing in keyword_map matches."""
+    if fallback is None:
+        fallback = text if text else "Unknown"
+    if not text:
+        return fallback
+    upper = str(text).upper()
+    for keyword, label in keyword_map:
+        if keyword in upper:
+            return label
+    return fallback
+
+
+EXTERIOR_KEYWORDS = [
+    ("RED", "Red"), ("BLUE", "Blue"), ("WHITE", "White"), ("BLACK", "Black"),
+    ("GREY", "Grey"), ("GRAY", "Grey"), ("SILVER", "Silver"), ("GREEN", "Green"),
+]
+INTERIOR_KEYWORDS = [
+    ("BLACK", "Black"), ("WHITE", "White"), ("CREAM", "Cream"),
+]
+TRIM_KEYWORDS = [
+    ("LONG RANGE", "Long Range"), ("PERFORMANCE", "Performance"),
+    ("PLAID", "Plaid"), ("STANDARD", "Standard Range"),
+]
+
+
 def extract_car_info(car):
     if not isinstance(car, dict):
         car = {}
@@ -108,17 +135,17 @@ def extract_car_info(car):
     vin = safe(lambda: car.get("VIN") or car.get("vin"), "UNKNOWN")
     price = safe(lambda: car.get("Price"))
     year = safe(lambda: car.get("Year"))
-    trim = safe(lambda: car.get("TrimName"))
+    raw_trim = safe(lambda: car.get("TrimName"))
 
     def get_exterior():
         names = find_option_descriptions(car, "PAINT")
         return names[0] if names else _first(car.get("PAINT"))
-    exterior = safe(get_exterior)
+    raw_exterior = safe(get_exterior)
 
     def get_interior():
         names = find_option_descriptions(car, "INTERIOR_COLORWAY")
         return names[0] if names else _first(car.get("INTERIOR"))
-    interior = safe(get_interior)
+    raw_interior = safe(get_interior)
 
     def get_autopilot():
         names = [n for n in find_option_descriptions(car, "AUTOPILOT") if isinstance(n, str)]
@@ -130,6 +157,20 @@ def extract_car_info(car):
             return "Basic Autopilot"
         return _first(car.get("AUTOPILOT"))
     autopilot = safe(get_autopilot)
+
+    def get_drivetrain():
+        parts = [raw_trim]
+        for key in ("CATEGORY", "TRIM"):
+            val = car.get(key)
+            if isinstance(val, list):
+                parts.append(" ".join(str(v) for v in val))
+        combined = " ".join(p for p in parts if p).upper()
+        if "AWD" in combined or "ALL-WHEEL" in combined or "ALL WHEEL" in combined:
+            return "AWD"
+        if "RWD" in combined or "REAR-WHEEL" in combined or "REAR WHEEL" in combined:
+            return "RWD"
+        return "Unknown"
+    drivetrain = safe(get_drivetrain)
 
     def get_photo():
         photos = car.get("VehiclePhotos") or []
@@ -147,45 +188,43 @@ def extract_car_info(car):
         "vin": vin,
         "price": price,
         "year": year,
-        "trim": trim,
-        "exterior": exterior,
-        "interior": interior,
+        "trim": short_label(raw_trim, TRIM_KEYWORDS, fallback=raw_trim),
+        "exterior": short_label(raw_exterior, EXTERIOR_KEYWORDS, fallback=raw_exterior),
+        "interior": short_label(raw_interior, INTERIOR_KEYWORDS, fallback=raw_interior),
         "autopilot": autopilot,
+        "drivetrain": drivetrain,
         "link": link,
         "photo_url": photo_url,
     }
 
 
-def _matches_any(text, keywords):
-    text = (text or "").upper()
-    return any(k in text for k in keywords)
+def classify_autopilot(autopilot):
+    if autopilot in ("Enhanced Autopilot", "Full Self-Driving"):
+        return "✅"
+    if autopilot == "Unknown":
+        return "❓"
+    return "❌"
 
 
 def classify_exterior(exterior):
-    # Your rule: red or blue is a no, everything else (black, grey, silver,
-    # white, etc.) is fine.
-    if exterior == "Unknown":
+    if exterior in ("Unknown", None):
         return "❓"
-    if _matches_any(exterior, ["RED", "BLUE"]):
+    if exterior in ("Red", "Blue"):
         return "❌"
     return "✅"
 
 
 def classify_interior(interior):
-    # Your rule: white/cream/light is good, black is not. Anything else
-    # (tan, grey interior, etc.) isn't covered by your rule, so this is
-    # marked unclear rather than guessed at.
-    if interior == "Unknown":
+    if interior in ("Unknown", None):
         return "❓"
-    if _matches_any(interior, ["BLACK"]):
+    if interior == "Black":
         return "❌"
-    if _matches_any(interior, ["WHITE", "CREAM", "LIGHT"]):
+    if interior in ("White", "Cream"):
         return "✅"
     return "❓"
 
 
 def classify_year(year):
-    # Your rule: 2025+ only (the Juniper refresh), 2024 and older is a no.
     try:
         y = int(year)
     except (TypeError, ValueError):
@@ -193,37 +232,59 @@ def classify_year(year):
     return "✅" if y >= 2025 else "❌"
 
 
-def build_message(info, model_name):
-    ap = info["autopilot"]
-    if ap in ("Enhanced Autopilot", "Full Self-Driving"):
-        ap_marker = "✅"
-    elif ap == "Unknown":
-        ap_marker = "❓"
-    else:
-        ap_marker = "❌"
+def classify_trim(trim):
+    # NOT fully confirmed: assumes Tesla writes "Long Range" in the Model Y
+    # trim name. Tell me the real TrimName text once you see one if this
+    # needs correcting.
+    if trim in ("Unknown", None):
+        return "❓"
+    if trim == "Long Range":
+        return "✅"
+    if trim in ("Performance", "Plaid", "Standard Range"):
+        return "❌"
+    return "❓"  # a trim word we don't recognize, not confident either way
 
+
+def classify_drivetrain(drivetrain):
+    # Preference only, this never causes a skip.
+    if drivetrain == "AWD":
+        return "⭐"
+    if drivetrain == "RWD":
+        return "✅"
+    return "❓"
+
+
+def esc(value):
+    return html.escape(str(value), quote=False)
+
+
+def build_message(info, model_name):
+    ap_marker = classify_autopilot(info["autopilot"])
     ext_marker = classify_exterior(info["exterior"])
     int_marker = classify_interior(info["interior"])
     year_marker = classify_year(info["year"])
+    trim_marker = classify_trim(info["trim"])
+    drive_marker = classify_drivetrain(info["drivetrain"])  # excluded from verdict on purpose
 
-    markers = [ap_marker, ext_marker, int_marker, year_marker]
-    if "❌" in markers:
+    hard_markers = [ap_marker, ext_marker, int_marker, year_marker, trim_marker]
+    if "❌" in hard_markers:
         verdict = "❌ SKIP: does not match your criteria"
-    elif "❓" in markers:
+    elif "❓" in hard_markers:
         verdict = "❓ Some details unclear, worth checking manually"
     else:
         verdict = "✅ Matches your criteria"
 
     return (
-        f"New Tesla {model_name} CPO\n\n"
-        f"{verdict}\n\n"
-        f"Year: {info['year']} {year_marker}\n"
-        f"Trim: {info['trim']}\n"
-        f"Exterior: {info['exterior']} {ext_marker}\n"
-        f"Interior: {info['interior']} {int_marker}\n"
-        f"Autopilot: {ap} {ap_marker}\n"
-        f"Price: AED {info['price']}\n"
-        f"Link: {info['link']}"
+        f"<b>New Tesla {esc(model_name)} CPO</b>\n\n"
+        f"<b>{esc(verdict)}</b>\n\n"
+        f"{year_marker} Year: <b>{esc(info['year'])}</b>\n"
+        f"{trim_marker} Trim: <b>{esc(info['trim'])}</b>\n"
+        f"{drive_marker} Drivetrain: <b>{esc(info['drivetrain'])}</b>\n"
+        f"{ext_marker} Exterior: <b>{esc(info['exterior'])}</b>\n"
+        f"{int_marker} Interior: <b>{esc(info['interior'])}</b>\n"
+        f"{ap_marker} Autopilot: <b>{esc(info['autopilot'])}</b>\n"
+        f"💰 Price: <b>AED {esc(info['price'])}</b>\n"
+        f"🔗 Link: <b>{esc(info['link'])}</b>"
     )
 
 
@@ -232,7 +293,12 @@ def send_telegram(text, photo_url=None):
         if photo_url:
             resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                data={"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url, "caption": text},
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "photo": photo_url,
+                    "caption": text,
+                    "parse_mode": "HTML",
+                },
                 timeout=15,
             )
             if resp.ok and resp.json().get("ok"):
@@ -241,7 +307,12 @@ def send_telegram(text, photo_url=None):
 
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
             timeout=15,
         )
     except Exception as e:
@@ -303,6 +374,7 @@ def send_test_message():
         "Price": 145000,
         "Year": 2022,
         "TrimName": "Long Range AWD",
+        "CATEGORY": ["MYLRAWD"],
         "PAINT": ["WHITE"],
         "INTERIOR": ["BLACK"],
         "AUTOPILOT": ["AUTOPILOT"],
@@ -314,7 +386,7 @@ def send_test_message():
         "VehiclePhotos": [],
     }
     info = extract_car_info(mock_car)
-    msg = "[TEST MESSAGE, this is not a real listing]\n\n" + build_message(info, "Model Y")
+    msg = "<b>[TEST MESSAGE, this is not a real listing]</b>\n\n" + build_message(info, "Model Y")
     send_telegram(msg, info["photo_url"])
     print(f"Sent mock test message, VIN {info['vin']}")
 
