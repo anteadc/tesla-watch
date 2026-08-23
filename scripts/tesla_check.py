@@ -156,14 +156,72 @@ def extract_car_info(car):
     }
 
 
+def _matches_any(text, keywords):
+    text = (text or "").upper()
+    return any(k in text for k in keywords)
+
+
+def classify_exterior(exterior):
+    # Your rule: red or blue is a no, everything else (black, grey, silver,
+    # white, etc.) is fine.
+    if exterior == "Unknown":
+        return "❓"
+    if _matches_any(exterior, ["RED", "BLUE"]):
+        return "❌"
+    return "✅"
+
+
+def classify_interior(interior):
+    # Your rule: white/cream/light is good, black is not. Anything else
+    # (tan, grey interior, etc.) isn't covered by your rule, so this is
+    # marked unclear rather than guessed at.
+    if interior == "Unknown":
+        return "❓"
+    if _matches_any(interior, ["BLACK"]):
+        return "❌"
+    if _matches_any(interior, ["WHITE", "CREAM", "LIGHT"]):
+        return "✅"
+    return "❓"
+
+
+def classify_year(year):
+    # Your rule: 2025+ only (the Juniper refresh), 2024 and older is a no.
+    try:
+        y = int(year)
+    except (TypeError, ValueError):
+        return "❓"
+    return "✅" if y >= 2025 else "❌"
+
+
 def build_message(info, model_name):
+    ap = info["autopilot"]
+    if ap in ("Enhanced Autopilot", "Full Self-Driving"):
+        ap_marker = "✅"
+    elif ap == "Unknown":
+        ap_marker = "❓"
+    else:
+        ap_marker = "❌"
+
+    ext_marker = classify_exterior(info["exterior"])
+    int_marker = classify_interior(info["interior"])
+    year_marker = classify_year(info["year"])
+
+    markers = [ap_marker, ext_marker, int_marker, year_marker]
+    if "❌" in markers:
+        verdict = "❌ SKIP: does not match your criteria"
+    elif "❓" in markers:
+        verdict = "❓ Some details unclear, worth checking manually"
+    else:
+        verdict = "✅ Matches your criteria"
+
     return (
         f"New Tesla {model_name} CPO\n\n"
-        f"Year: {info['year']}\n"
+        f"{verdict}\n\n"
+        f"Year: {info['year']} {year_marker}\n"
         f"Trim: {info['trim']}\n"
-        f"Exterior: {info['exterior']}\n"
-        f"Interior: {info['interior']}\n"
-        f"Autopilot: {info['autopilot']}\n"
+        f"Exterior: {info['exterior']} {ext_marker}\n"
+        f"Interior: {info['interior']} {int_marker}\n"
+        f"Autopilot: {ap} {ap_marker}\n"
         f"Price: AED {info['price']}\n"
         f"Link: {info['link']}"
     )
