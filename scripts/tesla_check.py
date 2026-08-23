@@ -5,7 +5,11 @@ import time
 import requests
 
 STATE_FILE = "seen_vins.json"
-LOOP_SECONDS = 270      # keep this under 300 (5 min) so it finishes before the next trigger
+LOOP_SECONDS = 3600     # 1 hour. Cron is still attempted every 5 min on
+                         # purpose, not stretched to hourly, that gives many
+                         # chances for one trigger to land and queue up the
+                         # next run the instant this one finishes, instead
+                         # of betting on a single hourly attempt succeeding.
 POLL_EVERY_SECONDS = 30
 URL = "https://www.tesla.com/inventory/api/v4/inventory-results"
 
