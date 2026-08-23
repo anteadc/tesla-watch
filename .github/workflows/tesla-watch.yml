@@ -13,6 +13,13 @@ on:
 permissions:
   contents: write
 
+# If a new run gets triggered while a 20-minute run is still in progress
+# (possible now that jobs run longer), queue it rather than running both
+# at once, avoids duplicate Telegram alerts for the same car.
+concurrency:
+  group: tesla-watch
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
