@@ -258,7 +258,7 @@ def esc(value):
     return html.escape(str(value), quote=False)
 
 
-def build_message(info, model_name):
+def build_message(info, model_name, model_code=None, is_test=False):
     ap_marker = classify_autopilot(info["autopilot"])
     ext_marker = classify_exterior(info["exterior"])
     int_marker = classify_interior(info["interior"])
@@ -274,7 +274,15 @@ def build_message(info, model_name):
     else:
         verdict = "✅ Matches your criteria"
 
+    # Rocket header: only for a real (non-test) Model Y that passes every
+    # hard filter, this is the "drop everything and go order it" signal,
+    # visible in the phone notification preview before you even open it.
+    is_full_match = verdict == "✅ Matches your criteria"
+    is_model_y = model_code == "my"
+    header = "🚀🚀🚀🚀🚀\n" if (is_full_match and is_model_y and not is_test) else ""
+
     return (
+        f"{header}"
         f"<b>New Tesla {esc(model_name)} CPO</b>\n\n"
         f"<b>{esc(verdict)}</b>\n\n"
         f"{year_marker} Year: <b>{esc(info['year'])}</b>\n"
@@ -344,7 +352,7 @@ def check_model(model_code, model_name, seen):
             info = extract_car_info(car)
             should_notify = NOTIFY_ONLY_MODEL is None or model_code == NOTIFY_ONLY_MODEL
             if should_notify:
-                msg = build_message(info, model_name)
+                msg = build_message(info, model_name, model_code=model_code, is_test=False)
                 send_telegram(msg, info["photo_url"])
                 print(f"[{model_name}] Notified: {info['vin']}")
             else:
@@ -386,7 +394,7 @@ def send_test_message():
         "VehiclePhotos": [],
     }
     info = extract_car_info(mock_car)
-    msg = "<b>[TEST MESSAGE, this is not a real listing]</b>\n\n" + build_message(info, "Model Y")
+    msg = "<b>[TEST MESSAGE, this is not a real listing]</b>\n\n" + build_message(info, "Model Y", model_code="my", is_test=True)
     send_telegram(msg, info["photo_url"])
     print(f"Sent mock test message, VIN {info['vin']}")
 
