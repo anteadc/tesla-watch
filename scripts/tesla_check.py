@@ -12,8 +12,6 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TEST_MESSAGE = os.environ.get("TEST_MESSAGE", "false").lower() == "true"
 
-# Tesla's API takes one model per request, so checking "everything" means
-# one request per model. Codes confirmed from tesla.com/en_AE/inventory/used/<code>
 MODELS = {
     "my": "Model Y",
     "m3": "Model 3",
@@ -31,7 +29,7 @@ def build_query(model_code):
         "query": {
             "model": model_code,
             "condition": "used",
-            "options": {"Year": [0]},
+            "options": {},   # was {"Year": [0]}, which likely matched zero cars, fixed
             "arrangeby": "Price",
             "order": "asc",
             "market": "AE",
@@ -73,58 +71,57 @@ def save_seen(seen):
 
 
 def _first(value):
-    """Some Tesla fields come back as a list with one item, some as a plain
-    string. Normalize either into a single value, or None."""
     if isinstance(value, list):
         return value[0] if value else None
     return value
 
 
+def find_option_descriptions(car, group_name):
+    """Collect human-readable names from OptionCodeData for a given group,
+    e.g. group_name='PAINT' -> ['Ultra Red']. Confirmed against real Dubai
+    Model X data on 2026-08-23."""
+    found = []
+    for opt in car.get("OptionCodeData") or []:
+        if opt.get("group") == group_name:
+            desc = opt.get("description") or opt.get("long_name") or opt.get("name")
+            if desc:
+                found.append(desc)
+    return found
+
+
 def extract_car_info(car):
-    # NOT YET CONFIRMED against a real Tesla API response, these are the
-    # field names used in community-documented Tesla API code. Exact keys
-    # (especially INTERIOR, AUTOPILOT, and any photo field) may differ.
-    # Once a real check prints a raw record to the Actions log, compare it
-    # against this function and fix any mismatch.
     vin = car.get("VIN") or car.get("vin") or "UNKNOWN"
     price = car.get("Price", "?")
     year = car.get("Year", "")
-    trim = car.get("TrimName", car.get("Trim", ""))
+    trim = car.get("TrimName", "")
 
-    exterior = _first(car.get("PAINT")) or "Unknown"
+    paint_names = find_option_descriptions(car, "PAINT")
+    exterior = paint_names[0] if paint_names else (_first(car.get("PAINT")) or "Unknown")
 
-    interior = (
-        _first(car.get("INTERIOR"))
-        or _first(car.get("INTERIOR_DECOR"))
-        or _first(car.get("Interior"))
-        or "Unknown"
-    )
+    interior_names = find_option_descriptions(car, "INTERIOR_COLORWAY")
+    interior = interior_names[0] if interior_names else (_first(car.get("INTERIOR")) or "Unknown")
 
-    autopilot_raw = _first(car.get("AUTOPILOT")) or _first(car.get("Autopilot"))
-    if autopilot_raw:
-        ap = str(autopilot_raw).upper()
-        if "FULL_SELF_DRIVING" in ap:
-            autopilot = "Full Self-Driving"
-        elif "ENHANCED" in ap:
-            autopilot = "Enhanced Autopilot"
-        elif "AUTOPILOT" in ap or "BASE" in ap:
-            autopilot = "Basic Autopilot"
-        else:
-            autopilot = str(autopilot_raw)
+    autopilot_names = find_option_descriptions(car, "AUTOPILOT")
+    if any("Full Self-Driving" in n for n in autopilot_names):
+        autopilot = "Full Self-Driving"
+    elif any("Enhanced Autopilot" in n for n in autopilot_names):
+        autopilot = "Enhanced Autopilot"
+    elif autopilot_names:
+        autopilot = "Basic Autopilot"
     else:
-        autopilot = "Unknown"
+        autopilot = _first(car.get("AUTOPILOT")) or "Unknown"
 
-    # Photo: Tesla is reported (per community trackers) to have stopped
-    # exposing per-vehicle photos in this API in recent years. These key
-    # names are a guess at what might still work. If none match, no photo
-    # is sent, which is fine, just text.
+    photos = car.get("VehiclePhotos") or []
     photo_url = None
-    for key in ("CompositorImageURL", "compositorURL", "IMAGE_URL", "Thumbnail", "thumbnail"):
-        val = _first(car.get(key))
-        if val:
-            photo_url = val
+    for p in photos:
+        if p.get("pictureType") == "Front Full View" and p.get("imageUrl"):
+            photo_url = p["imageUrl"]
             break
+    if not photo_url and photos:
+        photo_url = photos[0].get("imageUrl")
 
+    # NOT yet confirmed to load the right page, community convention. If a
+    # real alert's link goes somewhere wrong, tell me and I'll fix the format.
     link = f"https://www.tesla.com/en_AE/order/{vin}?redirect=no"
 
     return {
@@ -164,8 +161,6 @@ def send_telegram(text, photo_url=None):
             return
         print("Photo send failed, falling back to text-only message.")
 
-    # No photo URL, or the photo send failed: send plain text, and turn off
-    # Telegram's automatic link preview so it doesn't guess a wrong photo.
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
@@ -188,7 +183,7 @@ def check_model(model_code, model_name, seen):
             new_cars.append(car)
 
     if not seen and results:
-        print(f"[{model_name}] First check, raw sample record (use this to fix field names above):")
+        print(f"[{model_name}] First check, raw sample record:")
         print(json.dumps(results[0], indent=2))
 
     for car in new_cars:
@@ -222,11 +217,15 @@ def send_test_message():
         "Price": 145000,
         "Year": 2022,
         "TrimName": "Long Range AWD",
-        "PAINT": ["Pearl White"],
-        "INTERIOR": ["Black"],
-        "AUTOPILOT": ["TESLA_AUTOPILOT_ENHANCED_AUTOPILOT"],
-        # No photo field on purpose, this tests the no-photo fallback path,
-        # since real photos may not be available at all (see note above).
+        "PAINT": ["WHITE"],
+        "INTERIOR": ["BLACK"],
+        "AUTOPILOT": ["AUTOPILOT"],
+        "OptionCodeData": [
+            {"group": "PAINT", "description": "Pearl White Multi-Coat"},
+            {"group": "INTERIOR_COLORWAY", "description": "All Black Premium Interior"},
+            {"group": "AUTOPILOT", "description": "Enhanced Autopilot"},
+        ],
+        "VehiclePhotos": [],  # tests the no-photo fallback, a real case too
     }
     info = extract_car_info(mock_car)
     msg = "[TEST MESSAGE, this is not a real listing]\n\n" + build_message(info, "Model Y")
@@ -239,10 +238,6 @@ def main():
         send_test_message()
         return
 
-    # GitHub can only trigger this job once every 5 minutes at best.
-    # To get closer to 30-second checks, each job run stays alive for
-    # ~4.5 minutes and polls internally every 30 seconds, then exits
-    # just before the next scheduled trigger is due.
     seen = load_seen()
     start = time.time()
     while time.time() - start < LOOP_SECONDS:
