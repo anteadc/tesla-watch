@@ -13,9 +13,10 @@ on:
 permissions:
   contents: write
 
-# If a new run gets triggered while a 20-minute run is still in progress
-# (possible now that jobs run longer), queue it rather than running both
-# at once, avoids duplicate Telegram alerts for the same car.
+# Each run now polls for 4 minutes, so it finishes before the next 5-minute
+# trigger. GitHub only allows ONE queued run per concurrency group and cancels
+# the rest, which is why the old 60-minute job produced a wall of cancelled
+# runs. This keeps the queue empty.
 concurrency:
   group: tesla-watch
   cancel-in-progress: false
@@ -23,8 +24,13 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so `git pull --rebase` works when a previous run
+          # already pushed state.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -36,13 +42,30 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEST_MESSAGE: ${{ github.event.inputs.test_message }}
+          TEST_MESSAGE: ${{ inputs.test_message }}
         run: python scripts/tesla_check.py
 
+      # always() so a failed or cancelled run still saves the VINs it already
+      # alerted on. Without this you re-alert the same cars on the next run.
       - name: Commit updated state
+        if: always()
         run: |
           git config user.name "tesla-watch-bot"
           git config user.email "actions@github.com"
           git add seen_vins.json
-          git diff --staged --quiet || git commit -m "Update seen VINs"
-          git push
+          if git diff --staged --quiet; then
+            echo "No state change."
+            exit 0
+          fi
+          git commit -m "Update seen VINs [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "Push rejected, rebasing onto ${GITHUB_REF_NAME} and retrying"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || exit 1
+            sleep 3
+          done
+          echo "Could not push state after 5 attempts"
+          exit 1
