@@ -5,13 +5,23 @@ import time
 import requests
 
 STATE_FILE = "seen_vins.json"
-LOOP_SECONDS = 3600     # 1 hour. Cron is still attempted every 5 min on
-                         # purpose, not stretched to hourly, that gives many
-                         # chances for one trigger to land and queue up the
-                         # next run the instant this one finishes, instead
-                         # of betting on a single hourly attempt succeeding.
+
+# Job-length settings. Keep LOOP_SECONDS under the cron interval so runs do
+# not pile up in the concurrency queue and get cancelled.
+LOOP_SECONDS = 240          # 4 minutes of polling per run, cron fires every 5
 POLL_EVERY_SECONDS = 30
+
+# Telegram guardrails.
+MAX_ALERTS_PER_POLL = 12    # anything beyond this is marked seen + summarised
+SECONDS_BETWEEN_ALERTS = 2  # stays well under Telegram's ~20 msg/min limit
+FAIL_ALERT_AFTER = 3        # consecutive all-model fetch failures before pinging
+
 URL = "https://www.tesla.com/inventory/api/v4/inventory-results"
+
+# UNVERIFIED against the live UAE endpoint. If runs log "HTTP 4xx from Tesla",
+# this pair is the first thing to check.
+MARKET = "AE"
+SUPER_REGION = "north america"
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -24,10 +34,11 @@ MODELS = {
     "mx": "Model X",
 }
 
-# Set this to "my" once you've confirmed the pipeline works and only want
-# Model Y alerts. Leave as None to get alerts for ANY model.
-NOTIFY_ONLY_MODEL = None   # None = alert on any model. Change to "my" later.
+# Set to "my" to only alert on Model Y. None = alert on any model.
+NOTIFY_ONLY_MODEL = None
 
+
+# ---------------------------------------------------------------- Tesla fetch
 
 def build_query(model_code):
     return {
@@ -37,9 +48,9 @@ def build_query(model_code):
             "options": {},
             "arrangeby": "Price",
             "order": "asc",
-            "market": "AE",
+            "market": MARKET,
             "language": "en",
-            "super_region": "north america",
+            "super_region": SUPER_REGION,
             "PaymentType": "cash",
             "paymentRange": "0,999999",
         },
@@ -66,23 +77,150 @@ def fetch_inventory(model_code):
         URL,
         params={"query": json.dumps(build_query(model_code))},
         headers=headers,
-        timeout=15,
+        timeout=20,
     )
-    resp.raise_for_status()
-    return resp.json()
+    # Surface the real reason instead of a bare raise_for_status, so a 403 from
+    # the GitHub runner IP is readable straight from the Actions log.
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"HTTP {resp.status_code} from Tesla: {resp.text[:300]}"
+        )
+    try:
+        return resp.json()
+    except Exception:
+        raise RuntimeError(f"Non-JSON response from Tesla: {resp.text[:300]}")
 
 
-def load_seen():
+def collect_listings():
+    """Returns (cars, failed_model_names, ok_model_codes).
+
+    cars is a list of (model_code, model_name, car_dict).
+    """
+    cars = []
+    failed = []
+    ok = []
+    for model_code, model_name in MODELS.items():
+        try:
+            data = fetch_inventory(model_code)
+        except Exception as e:
+            print(f"[{model_name}] fetch failed: {e}")
+            failed.append(model_name)
+            continue
+        results = data.get("results", []) if isinstance(data, dict) else []
+        print(f"[{model_name}] {len(results)} listings returned")
+        ok.append(model_code)
+        for car in results:
+            if isinstance(car, dict):
+                cars.append((model_code, model_name, car))
+    return cars, failed, ok
+
+
+# ---------------------------------------------------------------------- state
+
+def load_state():
+    """seeded_models tracks which models already have a baseline, so a model
+    that was unreachable on an earlier run gets baselined silently later
+    instead of dumping its whole inventory into your chat."""
+    default = {"seen": set(), "seeded_models": set(), "fail_streak": 0}
     if not os.path.exists(STATE_FILE):
-        return set()
-    with open(STATE_FILE) as f:
-        return set(json.load(f))
+        return default
+    try:
+        with open(STATE_FILE) as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"State file unreadable, starting fresh: {e}")
+        return default
+
+    if isinstance(raw, list):  # old format
+        return {"seen": set(raw), "seeded_models": set(), "fail_streak": 0}
+
+    return {
+        "seen": set(raw.get("seen") or []),
+        "seeded_models": set(raw.get("seeded_models") or []),
+        "fail_streak": int(raw.get("fail_streak") or 0),
+    }
 
 
-def save_seen(seen):
-    with open(STATE_FILE, "w") as f:
-        json.dump(sorted(seen), f, indent=2)
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
+    payload = {
+        "seen": sorted(state["seen"]),
+        "seeded_models": sorted(state["seeded_models"]),
+        "fail_streak": state["fail_streak"],
+    }
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, STATE_FILE)
 
+
+# ------------------------------------------------------------------- Telegram
+
+def _deliver(method, payload):
+    """Returns (ok, retry_after_seconds_or_None)."""
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+            data=payload,
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"Telegram network error on {method}: {e}")
+        return False, 5
+
+    if resp.status_code == 429:
+        wait = 5
+        try:
+            wait = int(resp.json().get("parameters", {}).get("retry_after", 5))
+        except Exception:
+            pass
+        print(f"Telegram rate limited on {method}, waiting {wait}s")
+        return False, wait
+
+    if resp.ok:
+        try:
+            if resp.json().get("ok"):
+                return True, None
+        except Exception:
+            pass
+
+    print(f"Telegram {method} failed: {resp.status_code} {resp.text[:200]}")
+    return False, None
+
+
+def send_telegram(text, photo_url=None):
+    """Returns True only on a confirmed successful send."""
+    for _ in range(4):
+        if photo_url:
+            ok, retry = _deliver("sendPhoto", {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "photo": photo_url,
+                "caption": text,
+                "parse_mode": "HTML",
+            })
+            if ok:
+                return True
+            if retry:
+                time.sleep(retry)
+                continue
+            print("Photo send failed permanently, falling back to text.")
+            photo_url = None
+
+        ok, retry = _deliver("sendMessage", {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        })
+        if ok:
+            return True
+        if retry:
+            time.sleep(retry)
+            continue
+        return False
+    return False
+
+
+# ------------------------------------------------------------ car parsing
 
 def _first(value):
     if isinstance(value, list):
@@ -114,9 +252,6 @@ def find_option_descriptions(car, group_name):
 
 
 def short_label(text, keyword_map, fallback=None):
-    """Reduce a long descriptive string to a short scan-friendly word, e.g.
-    'Pearl White Multi-Coat' -> 'White'. Falls back to the original text if
-    nothing in keyword_map matches."""
     if fallback is None:
         fallback = text if text else "Unknown"
     if not text:
@@ -204,8 +339,6 @@ def extract_car_info(car):
     if not isinstance(damage_disclosure, bool):
         damage_disclosure = None
 
-    link = f"https://www.tesla.com/en_AE/order/{vin}?redirect=no"
-
     return {
         "vin": vin,
         "price": price,
@@ -217,10 +350,12 @@ def extract_car_info(car):
         "drivetrain": drivetrain,
         "history": raw_history.title() if raw_history else "Unknown",
         "damage_disclosure": damage_disclosure,
-        "link": link,
+        "link": f"https://www.tesla.com/en_AE/order/{vin}?redirect=no",
         "photo_url": photo_url,
     }
 
+
+# ----------------------------------------------------------- classification
 
 def classify_autopilot(autopilot):
     if autopilot in ("Enhanced Autopilot", "Full Self-Driving"):
@@ -231,11 +366,6 @@ def classify_autopilot(autopilot):
 
 
 def classify_history(history, damage_disclosure):
-    # Confirmed field names (VehicleHistory, DamageDisclosure) from a real
-    # Dubai listing. "CLEAN" is the only value seen so far, anything else
-    # is treated as a repair/damage flag. Not yet confirmed what a real
-    # non-clean value actually reads as, tell me if this needs adjusting
-    # once you see one flagged wrong.
     if history == "Unknown" and damage_disclosure is None:
         return "❓"
     if damage_disclosure is True:
@@ -274,20 +404,16 @@ def classify_year(year):
 
 
 def classify_trim(trim):
-    # NOT fully confirmed: assumes Tesla writes "Long Range" in the Model Y
-    # trim name. Tell me the real TrimName text once you see one if this
-    # needs correcting.
     if trim in ("Unknown", None):
         return "❓"
     if trim == "Long Range":
         return "✅"
     if trim in ("Performance", "Plaid", "Standard Range"):
         return "❌"
-    return "❓"  # a trim word we don't recognize, not confident either way
+    return "❓"
 
 
 def classify_drivetrain(drivetrain):
-    # Preference only, this never causes a skip.
     if drivetrain == "AWD":
         return "⭐"
     if drivetrain == "RWD":
@@ -305,23 +431,19 @@ def build_message(info, model_name, model_code=None, is_test=False):
     int_marker = classify_interior(info["interior"])
     year_marker = classify_year(info["year"])
     trim_marker = classify_trim(info["trim"])
-    drive_marker = classify_drivetrain(info["drivetrain"])  # excluded from verdict on purpose
+    drive_marker = classify_drivetrain(info["drivetrain"])
     history_marker = classify_history(info["history"], info["damage_disclosure"])
 
-    hard_markers = [ap_marker, ext_marker, int_marker, year_marker, trim_marker, history_marker]
-    if "❌" in hard_markers:
+    hard = [ap_marker, ext_marker, int_marker, year_marker, trim_marker, history_marker]
+    if "❌" in hard:
         verdict = "❌ SKIP: does not match your criteria"
-    elif "❓" in hard_markers:
+    elif "❓" in hard:
         verdict = "❓ Some details unclear, worth checking manually"
     else:
         verdict = "✅ Matches your criteria"
 
-    # Rocket header: only for a real (non-test) Model Y that passes every
-    # hard filter, this is the "drop everything and go order it" signal,
-    # visible in the phone notification preview before you even open it.
     is_full_match = verdict == "✅ Matches your criteria"
-    is_model_y = model_code == "my"
-    header = "🚀🚀🚀🚀🚀\n" if (is_full_match and is_model_y and not is_test) else ""
+    header = "🚀🚀🚀🚀🚀\n" if (is_full_match and model_code == "my" and not is_test) else ""
 
     return (
         f"{header}"
@@ -339,90 +461,100 @@ def build_message(info, model_name, model_code=None, is_test=False):
     )
 
 
-def send_telegram(text, photo_url=None):
-    """Returns True only on a confirmed successful send."""
-    try:
-        if photo_url:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "photo": photo_url,
-                    "caption": text,
-                    "parse_mode": "HTML",
-                },
-                timeout=15,
+# ------------------------------------------------------------------ main loop
+
+def check_once(state):
+    cars, failed, ok_models = collect_listings()
+
+    if not ok_models:
+        state["fail_streak"] += 1
+        print(f"Every model fetch failed. Streak: {state['fail_streak']}")
+        if state["fail_streak"] == FAIL_ALERT_AFTER:
+            send_telegram(
+                "<b>⚠️ Tesla watch is blind</b>\n\n"
+                f"The last {FAIL_ALERT_AFTER} attempts to read Tesla inventory "
+                "all failed. You are not being alerted about new cars right now. "
+                "Open the GitHub Actions log to see the HTTP error."
             )
-            if resp.ok and resp.json().get("ok"):
-                return True
-            print("Photo send failed, falling back to text-only message.")
+        save_state(state)
+        return
 
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=15,
-        )
-        if resp.ok and resp.json().get("ok"):
-            return True
-        print(f"Telegram sendMessage failed: {resp.status_code} {resp.text[:200]}")
-        return False
-    except Exception as e:
-        print(f"Telegram send failed, will not crash the run: {e}")
-        return False
+    if state["fail_streak"] >= FAIL_ALERT_AFTER:
+        send_telegram("<b>✅ Tesla watch recovered</b>\n\nInventory reads are working again.")
+    state["fail_streak"] = 0
 
+    was_armed = bool(state["seeded_models"])
+    baseline = []
+    new_cars = []
 
-def check_model(model_code, model_name, seen):
-    data = fetch_inventory(model_code)
-    results = data.get("results", []) if isinstance(data, dict) else []
-    new_seen = set(seen)
-
-    if not seen and results:
-        print(f"[{model_name}] First check, raw sample record:")
-        print(json.dumps(results[0], indent=2))
-
-    for car in results:
-        if not isinstance(car, dict):
-            continue
+    for model_code, model_name, car in cars:
         vin = car.get("VIN") or car.get("vin")
-        if not vin or vin in seen:
+        if not vin or vin in state["seen"]:
+            continue
+        if model_code in state["seeded_models"]:
+            new_cars.append((model_code, model_name, car, vin))
+        else:
+            baseline.append(vin)
+
+    if baseline:
+        state["seen"].update(baseline)
+        print(f"Baselined {len(baseline)} existing listings without alerting.")
+    state["seeded_models"].update(ok_models)
+    save_state(state)
+
+    if not was_armed:
+        send_telegram(
+            "<b>Tesla watch armed</b>\n\n"
+            f"Baseline saved: {len(state['seen'])} listings already live on Tesla UAE.\n"
+            "From now on you only get a message when a NEW car appears."
+        )
+        print(f"Armed with {len(state['seen'])} VINs.")
+        return
+
+    if not new_cars:
+        print("No new listings.")
+        return
+
+    print(f"{len(new_cars)} new listing(s).")
+
+    for i, (model_code, model_name, car, vin) in enumerate(new_cars):
+        if i >= MAX_ALERTS_PER_POLL:
+            overflow = new_cars[MAX_ALERTS_PER_POLL:]
+            state["seen"].update(v for _, _, _, v in overflow)
+            save_state(state)
+            send_telegram(
+                f"<b>{len(overflow)} more new listings</b> were skipped this round "
+                "to stay under Telegram's rate limit. "
+                "Check https://www.tesla.com/en_AE/inventory/used/my directly."
+            )
+            break
+
+        if NOTIFY_ONLY_MODEL is not None and model_code != NOTIFY_ONLY_MODEL:
+            state["seen"].add(vin)
+            save_state(state)
+            print(f"[{model_name}] {vin} skipped, filtered to {NOTIFY_ONLY_MODEL}")
             continue
 
         try:
             info = extract_car_info(car)
-            should_notify = NOTIFY_ONLY_MODEL is None or model_code == NOTIFY_ONLY_MODEL
-            if should_notify:
-                msg = build_message(info, model_name, model_code=model_code, is_test=False)
-                delivered = send_telegram(msg, info["photo_url"])
-                if delivered:
-                    new_seen.add(vin)
-                    print(f"[{model_name}] Notified: {info['vin']}")
-                else:
-                    print(f"[{model_name}] Notify FAILED for {info['vin']}, not marked seen, will retry next loop")
-            else:
-                new_seen.add(vin)
-                print(f"[{model_name}] New listing found (not notified, filtered to {NOTIFY_ONLY_MODEL}): {info['vin']}")
+            msg = build_message(info, model_name, model_code=model_code)
+            delivered = send_telegram(msg, info["photo_url"])
         except Exception as e:
-            vin_guess = car.get("VIN", "unknown VIN") if isinstance(car, dict) else "unknown VIN"
-            print(f"[{model_name}] Failed to process car {vin_guess}, not marked seen, will retry next loop: {e}")
+            print(f"[{model_name}] could not parse {vin}: {e}")
+            delivered = send_telegram(
+                f"<b>New Tesla {esc(model_name)} CPO</b>\n\n"
+                "Details could not be read, open it directly:\n"
+                f"https://www.tesla.com/en_AE/order/{esc(vin)}?redirect=no"
+            )
 
-    if new_seen == seen:
-        print(f"[{model_name}] No new listings. {len(results)} total in current search.")
+        if delivered:
+            state["seen"].add(vin)
+            save_state(state)   # written immediately, survives a cancelled job
+            print(f"[{model_name}] notified {vin}")
+        else:
+            print(f"[{model_name}] send failed for {vin}, will retry next poll")
 
-    return new_seen
-
-
-def check_once(seen):
-    for model_code, model_name in MODELS.items():
-        try:
-            seen = check_model(model_code, model_name, seen)
-        except Exception as e:
-            print(f"[{model_name}] Check failed, will retry next loop: {e}")
-    return seen
+        time.sleep(SECONDS_BETWEEN_ALERTS)
 
 
 def send_test_message():
@@ -445,9 +577,13 @@ def send_test_message():
         "VehiclePhotos": [],
     }
     info = extract_car_info(mock_car)
-    msg = "<b>[TEST MESSAGE, this is not a real listing]</b>\n\n" + build_message(info, "Model Y", model_code="my", is_test=True)
-    send_telegram(msg, info["photo_url"])
-    print(f"Sent mock test message, VIN {info['vin']}")
+    msg = "<b>[TEST MESSAGE, this is not a real listing]</b>\n\n" + build_message(
+        info, "Model Y", model_code="my", is_test=True
+    )
+    ok = send_telegram(msg, info["photo_url"])
+    print(f"Test message delivered: {ok}")
+    if not ok:
+        raise SystemExit("Telegram test send failed, check the secrets.")
 
 
 def main():
@@ -455,12 +591,21 @@ def main():
         send_test_message()
         return
 
-    seen = load_seen()
+    state = load_state()
     start = time.time()
-    while time.time() - start < LOOP_SECONDS:
-        seen = check_once(seen)
+    while True:
+        try:
+            check_once(state)
+        except Exception as e:
+            # Never lose the run's progress to an unexpected error.
+            print(f"Unexpected error in poll: {e}")
+            save_state(state)
+        if time.time() - start >= LOOP_SECONDS:
+            break
         time.sleep(POLL_EVERY_SECONDS)
-    save_seen(seen)
+
+    save_state(state)
+    print("Run complete.")
 
 
 if __name__ == "__main__":
