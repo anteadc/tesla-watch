@@ -301,6 +301,7 @@ def build_message(info, model_name, model_code=None, is_test=False):
 
 
 def send_telegram(text, photo_url=None):
+    """Returns True only on a confirmed successful send."""
     try:
         if photo_url:
             resp = requests.post(
@@ -314,10 +315,10 @@ def send_telegram(text, photo_url=None):
                 timeout=15,
             )
             if resp.ok and resp.json().get("ok"):
-                return
+                return True
             print("Photo send failed, falling back to text-only message.")
 
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -327,45 +328,50 @@ def send_telegram(text, photo_url=None):
             },
             timeout=15,
         )
+        if resp.ok and resp.json().get("ok"):
+            return True
+        print(f"Telegram sendMessage failed: {resp.status_code} {resp.text[:200]}")
+        return False
     except Exception as e:
         print(f"Telegram send failed, will not crash the run: {e}")
+        return False
 
 
 def check_model(model_code, model_name, seen):
     data = fetch_inventory(model_code)
     results = data.get("results", []) if isinstance(data, dict) else []
     new_seen = set(seen)
-    new_cars = []
-
-    for car in results:
-        if not isinstance(car, dict):
-            continue
-        vin = car.get("VIN") or car.get("vin")
-        if not vin:
-            continue
-        new_seen.add(vin)
-        if vin not in seen:
-            new_cars.append(car)
 
     if not seen and results:
         print(f"[{model_name}] First check, raw sample record:")
         print(json.dumps(results[0], indent=2))
 
-    for car in new_cars:
+    for car in results:
+        if not isinstance(car, dict):
+            continue
+        vin = car.get("VIN") or car.get("vin")
+        if not vin or vin in seen:
+            continue
+
         try:
             info = extract_car_info(car)
             should_notify = NOTIFY_ONLY_MODEL is None or model_code == NOTIFY_ONLY_MODEL
             if should_notify:
                 msg = build_message(info, model_name, model_code=model_code, is_test=False)
-                send_telegram(msg, info["photo_url"])
-                print(f"[{model_name}] Notified: {info['vin']}")
+                delivered = send_telegram(msg, info["photo_url"])
+                if delivered:
+                    new_seen.add(vin)
+                    print(f"[{model_name}] Notified: {info['vin']}")
+                else:
+                    print(f"[{model_name}] Notify FAILED for {info['vin']}, not marked seen, will retry next loop")
             else:
+                new_seen.add(vin)
                 print(f"[{model_name}] New listing found (not notified, filtered to {NOTIFY_ONLY_MODEL}): {info['vin']}")
         except Exception as e:
             vin_guess = car.get("VIN", "unknown VIN") if isinstance(car, dict) else "unknown VIN"
-            print(f"[{model_name}] Failed to process car {vin_guess}, skipped, moving on: {e}")
+            print(f"[{model_name}] Failed to process car {vin_guess}, not marked seen, will retry next loop: {e}")
 
-    if not new_cars:
+    if new_seen == seen:
         print(f"[{model_name}] No new listings. {len(results)} total in current search.")
 
     return new_seen
